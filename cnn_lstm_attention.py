@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Input, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D, Conv1D
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, LSTM, Dense, Input, Dropout, Attention, GlobalAveragePooling1D, Concatenate, LayerNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
@@ -20,7 +20,7 @@ EPOCHS = 50
 BATCH_SIZE = 32
 
 # ===================================================================
-# 1. Load and Merge Data
+# 1. Load and Merge Data (Standard Pipeline)
 # ===================================================================
 print(" 🚀  Step 1: Loading and merging data...")
 try:
@@ -76,40 +76,42 @@ def create_sequences(X, y, time_steps):
 
 X_train, y_train = create_sequences(X_train_scaled, y_train_scaled, TIME_STEPS)
 X_test, y_test = create_sequences(X_test_scaled, y_test_scaled, TIME_STEPS)
-print(f" ✅  Sequences ready. Input shape: {X_train.shape}")
 
 # ===================================================================
-# 5. Build Transformer Model
+# 5. Build CNN-LSTM-Attention Model
 # ===================================================================
-print("\n 🚀  Step 5: Building Transformer Model...")
+print("\n 🚀  Step 5: Building CNN-LSTM with Attention...")
 
-def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
-    # Attention and Normalization
-    x = MultiHeadAttention(
-        key_dim=head_size, num_heads=num_heads, dropout=dropout
-    )(inputs, inputs)
-    x = Dropout(dropout)(x)
-    x = LayerNormalization(epsilon=1e-6)(x + inputs)
-
-    # Feed Forward Part
-    ff = Conv1D(filters=ff_dim, kernel_size=1, activation="relu")(x)
-    ff = Dropout(dropout)(ff)
-    ff = Conv1D(filters=inputs.shape[-1], kernel_size=1)(ff)
-    return LayerNormalization(epsilon=1e-6)(x + ff)
-
-input_shape = (X_train.shape[1], X_train.shape[2])
+input_shape = (X_train.shape[1], X_train.shape[2]) 
 inputs = Input(shape=input_shape)
 
-# Transformer Block
-# We use 4 heads and a head_size of 64 (standard for this data size)
-x = transformer_encoder(inputs, head_size=64, num_heads=4, ff_dim=64, dropout=0.1)
+# --- 1. CNN Block (Feature Extraction) ---
+# Extracts local short-term patterns (e.g., daily spikes)
+x = Conv1D(filters=64, kernel_size=3, padding='same', activation='relu')(inputs)
+x = MaxPooling1D(pool_size=2)(x)
+x = Dropout(0.2)(x)
 
-# Pooling (Flattening the sequence)
-x = GlobalAveragePooling1D(data_format="channels_last")(x)
+# --- 2. LSTM Block (Sequence Learning) ---
+# return_sequences=True is CRITICAL here. 
+# It keeps the time dimension so Attention can look at each step.
+lstm_out = LSTM(64, return_sequences=True, activation='relu')(x)
+lstm_out = LayerNormalization()(lstm_out) # Stabilizes training
 
-# MLP Head (Final layers)
-x = Dense(64, activation="relu")(x)
-x = Dropout(0.1)(x)
+# --- 3. Attention Mechanism ---
+# Self-attention: Query and Value are both the LSTM output.
+# The model asks "Which parts of my own history are important?"
+# We use a built-in Keras Attention layer.
+attention_out = Attention()([lstm_out, lstm_out])
+
+# --- 4. Fusion & Output ---
+# We combine the LSTM memory with the Attention focus
+x = Concatenate()([lstm_out, attention_out])
+
+# Flatten the timeline to a single vector
+x = GlobalAveragePooling1D()(x)
+
+x = Dense(64, activation='relu')(x)
+x = Dropout(0.2)(x)
 outputs = Dense(1)(x)
 
 model = Model(inputs=inputs, outputs=outputs)
@@ -139,18 +141,18 @@ mse = np.mean((y_actual - y_pred)**2)
 rmse = np.sqrt(mse)
 mae = np.mean(np.abs(y_actual - y_pred))
 
-print("\n==================================")
-print(f" TRANSFORMER RESULTS FOR {TARGET_VARIABLE}")
-print("==================================")
+print("\n===========================================")
+print(f" CNN-LSTM-ATTENTION RESULTS FOR {TARGET_VARIABLE}")
+print("===========================================")
 print(f" RMSE: {rmse:.2f}")
 print(f" MAE:  {mae:.2f}")
-print("==================================")
+print("===========================================")
 
 plt.figure(figsize=(15, 6))
 plt.plot(y_actual, label='Actual', color='blue', alpha=0.6)
-plt.plot(y_pred, label='Predicted (Transformer)', color='orange', linestyle='--')
-plt.title(f'Corrected Transformer Model: {TARGET_VARIABLE} Prediction')
+plt.plot(y_pred, label='Predicted (Attention)', color='darkorange', linestyle='--')
+plt.title(f'CNN-LSTM with Attention: {TARGET_VARIABLE} Prediction')
 plt.legend()
-plt.savefig("transformer_corrected_results.png")
-print(" ✅  Plot saved as 'transformer_corrected_results.png'")
+plt.savefig("cnn_lstm_attention_results.png")
+print(" ✅  Plot saved as 'cnn_lstm_attention_results.png'")
 plt.show()

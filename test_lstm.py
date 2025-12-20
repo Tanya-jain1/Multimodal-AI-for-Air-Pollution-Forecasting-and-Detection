@@ -1,150 +1,167 @@
 import pandas as pd
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras.layers import LSTM, Dense, Input, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
+import os
 
 # ===================================================================
 # Configuration
 # ===================================================================
-AQ_DATA_FILE = "delhi_aq_featured_daily.csv"
-WEATHER_DATA_FILE = "delhi_weather_processed.csv"
-TARGET_POLLUTANT = "pm25"
-SEQUENCE_LENGTH = 30
-FORECAST_HORIZON = 1
+# Use the NEW cleaned raw files
+AQ_DATA_FILE = "delhi_aq_cleaned_raw.csv"
+WEATHER_DATA_FILE = "delhi_weather_cleaned_raw.csv"
+TARGET_VARIABLE = "pm25"
+
+# Matching the GRU settings for fair comparison
+TIME_STEPS = 30  
+EPOCHS = 50
+BATCH_SIZE = 32
 
 # ===================================================================
 # 1. Load and Merge Data
 # ===================================================================
-print("🚀 Step 1: Loading and merging data...")
+print(" 🚀  Step 1: Loading and merging data...")
 
-# Load datasets
-aq_df = pd.read_csv(AQ_DATA_FILE)
-weather_df = pd.read_csv(WEATHER_DATA_FILE)
+try:
+    aq_df = pd.read_csv(AQ_DATA_FILE, parse_dates=True, index_col='datetime')
+    weather_df = pd.read_csv(WEATHER_DATA_FILE, parse_dates=True, index_col='DATE')
+    
+    # Merge on index
+    df_merged = aq_df.join(weather_df, how='inner')
+    print(" ✅  Data merged. Shape:", df_merged.shape)
 
-# Convert date columns to datetime objects and set as index
-aq_df['datetime'] = pd.to_datetime(aq_df['datetime'])
-weather_df['DATE'] = pd.to_datetime(weather_df['DATE'])
-aq_df = aq_df.set_index('datetime')
-weather_df = weather_df.set_index('DATE')
-
-# Merge the two dataframes
-df_merged = aq_df.join(weather_df, how='inner')
-print(f"Merged data shape: {df_merged.shape}")
-print("Merged data preview:\n", df_merged.head())
+except FileNotFoundError:
+    print(" ❌  Error: Files not found. Run the cleaning scripts first!")
+    exit()
 
 # ===================================================================
-# 2. Final Data Preparation for Modeling
+# 2. Feature Selection & Outlier Safety
 # ===================================================================
-print("\n🚀 Step 2: Preparing data for time series modeling...")
+print("\n 🚀  Step 2: Selecting features...")
 
-# Select only numeric columns for modeling
-df_numeric = df_merged.select_dtypes(include=np.number)
+# Select raw features (Pollutants + Weather)
+# We do NOT use lags here; LSTM has internal memory for that.
+selected_columns = [
+    'pm25', 'pm10', 'no2', 'so2', 'co', 'o3',
+    'temp', 'humidity', 'windspeed', 'precip', 'sealevelpressure'
+]
 
-# Reorder columns to have the target variable first
-cols = [TARGET_POLLUTANT] + [col for col in df_numeric.columns if col != TARGET_POLLUTANT]
-df_final = df_numeric[cols]
+# Keep only columns that actually exist in the file
+existing_cols = [c for c in selected_columns if c in df_merged.columns]
+df_model = df_merged[existing_cols].copy()
 
-# Scale all features to a range between 0 and 1
-scaler = MinMaxScaler()
-scaled_data = scaler.fit_transform(df_final)
+# Safety Clip: Ensure no extreme outliers remain (redundant if cleaning script ran, but safe)
+if 'pm25' in df_model.columns: df_model['pm25'] = df_model['pm25'].clip(upper=600)
+if 'co' in df_model.columns: df_model['co'] = df_model['co'].clip(upper=2000)
 
-# Create a separate scaler for the target variable to inverse transform predictions later
+df_model = df_model.fillna(method='ffill').fillna(method='bfill')
+
+# ===================================================================
+# 3. Split and Scale (The "No Leakage" Way)
+# ===================================================================
+print("\n 🚀  Step 3: Splitting and Scaling...")
+
+# SPLIT FIRST
+train_size = int(len(df_model) * 0.8)
+train_df = df_model.iloc[:train_size]
+test_df = df_model.iloc[train_size:]
+
+print(f"    - Training samples: {len(train_df)}")
+print(f"    - Testing samples: {len(test_df)}")
+
+# SCALE SECOND
+feature_scaler = MinMaxScaler()
 target_scaler = MinMaxScaler()
-target_scaler.fit(df_final[[TARGET_POLLUTANT]])
 
-# Function to create sequences of data for time series forecasting
-def create_sequences(data, seq_length, forecast_horizon):
-    X, y = [], []
-    for i in range(len(data) - seq_length - forecast_horizon + 1):
-        X.append(data[i:(i + seq_length), :])
-        y.append(data[i + seq_length + forecast_horizon - 1, 0]) # Target is the first column
-    return np.array(X), np.array(y)
+# Fit on TRAIN only
+X_train_scaled = feature_scaler.fit_transform(train_df)
+y_train_scaled = target_scaler.fit_transform(train_df[[TARGET_VARIABLE]])
 
-X, y = create_sequences(scaled_data, SEQUENCE_LENGTH, FORECAST_HORIZON)
-print(f"Shape of X (sequences, timesteps, features): {X.shape}")
-print(f"Shape of y (labels): {y.shape}")
-
-# Split data into training, validation, and test sets (80-10-10 split)
-train_size = int(len(X) * 0.8)
-val_size = int(len(X) * 0.1)
-
-X_train, y_train = X[:train_size], y[:train_size]
-X_val, y_val = X[train_size:train_size + val_size], y[train_size:train_size + val_size]
-X_test, y_test = X[train_size + val_size:], y[train_size + val_size:]
-
-print(f"Training set size: {len(X_train)}")
-print(f"Validation set size: {len(X_val)}")
-print(f"Test set size: {len(X_test)}")
+# Transform TEST using train statistics
+X_test_scaled = feature_scaler.transform(test_df)
+y_test_scaled = target_scaler.transform(test_df[[TARGET_VARIABLE]])
 
 # ===================================================================
-# 3. Build and Train LSTM Model
+# 4. Create Sequences
 # ===================================================================
-print("\n🚀 Step 3: Building and training the LSTM model...")
+def create_sequences(X, y, time_steps):
+    Xs, ys = [], []
+    for i in range(len(X) - time_steps):
+        Xs.append(X[i:(i + time_steps)])
+        ys.append(y[i + time_steps])
+    return np.array(Xs), np.array(ys)
 
-lstm_model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(X_train.shape[1], X_train.shape[2])),
-    tf.keras.layers.LSTM(64, return_sequences=True),
-    tf.keras.layers.Dropout(0.2),
-    tf.keras.layers.LSTM(32),
-    tf.keras.layers.Dropout(0.2),
-    tf.keras.layers.Dense(16, activation='relu'),
-    tf.keras.layers.Dense(1)
-])
+X_train, y_train = create_sequences(X_train_scaled, y_train_scaled, TIME_STEPS)
+X_test, y_test = create_sequences(X_test_scaled, y_test_scaled, TIME_STEPS)
 
-lstm_model.compile(optimizer='adam', loss='mean_squared_error')
-lstm_model.summary()
+print(f" ✅  Sequences ready. Input shape: {X_train.shape}")
 
-# Callback to stop training early if validation loss stops improving
-early_stopping = tf.keras.callbacks.EarlyStopping(
-    monitor='val_loss',
-    patience=10,
-    restore_best_weights=True
-)
+# ===================================================================
+# 5. Build LSTM Model
+# ===================================================================
+print("\n 🚀  Step 5: Building Stacked LSTM Model...")
 
-history_lstm = lstm_model.fit(
-    X_train,
-    y_train,
-    epochs=100,
-    batch_size=32,
-    validation_data=(X_val, y_val),
-    callbacks=[early_stopping],
+input_shape = (X_train.shape[1], X_train.shape[2]) 
+input_layer = Input(shape=input_shape)
+
+# Layer 1: LSTM with return_sequences=True (passes sequence to next layer)
+x = LSTM(64, return_sequences=True, activation='relu')(input_layer)
+x = Dropout(0.2)(x) # Reduce overfitting
+
+# Layer 2: Standard LSTM (condenses to single vector)
+x = LSTM(32, return_sequences=False, activation='relu')(x)
+x = Dropout(0.2)(x)
+
+output_layer = Dense(1)(x)
+
+model = Model(inputs=input_layer, outputs=output_layer)
+model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+model.summary()
+
+# ===================================================================
+# 6. Train
+# ===================================================================
+history = model.fit(
+    X_train, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_split=0.1,
     verbose=1
 )
 
-print("✅ LSTM model training complete.")
-
 # ===================================================================
-# 4. Evaluate and Visualize LSTM Model
+# 7. Evaluate
 # ===================================================================
-print("\n🚀 Step 4: Evaluating the LSTM model...")
+print("\n 🚀  Step 7: Evaluating...")
 
-# Make predictions on the test set
-predictions_lstm_scaled = lstm_model.predict(X_test)
+y_pred_scaled = model.predict(X_test)
 
-# Inverse scale the predictions and actual values to their original range
-predictions_lstm = target_scaler.inverse_transform(predictions_lstm_scaled)
-y_test_actual = target_scaler.inverse_transform(y_test.reshape(-1, 1))
+# Inverse Transform
+y_pred = target_scaler.inverse_transform(y_pred_scaled)
+y_actual = target_scaler.inverse_transform(y_test)
 
-# Calculate and print performance metrics
-mae = mean_absolute_error(y_test_actual, predictions_lstm)
-rmse = np.sqrt(mean_squared_error(y_test_actual, predictions_lstm))
-print(f"--- LSTM Model Metrics ---")
-print(f"Mean Absolute Error (MAE): {mae:.2f}")
-print(f"Root Mean Squared Error (RMSE): {rmse:.2f}\n")
+# Calculate Metrics
+mse = np.mean((y_actual - y_pred)**2)
+rmse = np.sqrt(mse)
+mae = np.mean(np.abs(y_actual - y_pred))
 
-# Plot the results
-print("📊 Generating plot...")
-plt.style.use('seaborn-v0_8-whitegrid')
-fig = plt.figure(figsize=(18, 7))
-plt.title(f'LSTM Model: Actual vs. Predicted {TARGET_POLLUTANT}', fontsize=16)
+print("\n==================================")
+print(f" LSTM RESULTS FOR {TARGET_VARIABLE}")
+print("==================================")
+print(f" RMSE: {rmse:.2f}")
+print(f" MAE:  {mae:.2f}")
+print("==================================")
 
-# Plotting both actual and predicted values as lines
-plt.plot(y_test_actual, label='Actual Values', color='blue', linewidth=2)
-plt.plot(predictions_lstm, label='LSTM Predictions', color='orangered', linewidth=2, linestyle='--')
-
-plt.xlabel('Time (Days in Test Set)')
-plt.ylabel(f'{TARGET_POLLUTANT} Concentration')
+# Plot
+plt.figure(figsize=(15, 6))
+plt.plot(y_actual, label='Actual', color='blue', alpha=0.6)
+plt.plot(y_pred, label='Predicted (LSTM)', color='green', linestyle='--')
+plt.title(f'Corrected LSTM Model: {TARGET_VARIABLE} Prediction')
 plt.legend()
+plt.savefig("lstm_corrected_results.png")
+print(" ✅  Plot saved as 'lstm_corrected_results.png'")
 plt.show()

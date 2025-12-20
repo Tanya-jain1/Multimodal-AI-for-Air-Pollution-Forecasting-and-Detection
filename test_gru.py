@@ -1,184 +1,173 @@
-#GRU
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import GRU, Dense, Input
+from tensorflow.keras.layers import GRU, Dense, Input, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
+import os
 
 # ===================================================================
 # Configuration
 # ===================================================================
-AQ_DATA_FILE = "delhi_aq_featured_daily.csv"
-WEATHER_DATA_FILE = "delhi_weather_processed.csv"
+AQ_DATA_FILE = "delhi_aq_cleaned_raw.csv"
+WEATHER_DATA_FILE = "delhi_weather_cleaned_raw.csv"
 TARGET_VARIABLE = "pm25"
-TIME_STEPS = 10  # How many past days of data the model will see to predict the next day
+
+# IMPROVEMENT: Increased from 10 to 30 to capture monthly trends
+TIME_STEPS = 30  
 EPOCHS = 50
 BATCH_SIZE = 32
 
 # ===================================================================
 # 1. Load and Merge Data
 # ===================================================================
-print("🚀 Step 1: Loading and merging data...")
+print(" 🚀  Step 1: Loading and merging data...")
 
-# Load the datasets
-aq_df = pd.read_csv(AQ_DATA_FILE, parse_dates=True, index_col='datetime')
-weather_df = pd.read_csv(WEATHER_DATA_FILE, parse_dates=True, index_col='DATE')
-
-# Merge the two dataframes on their date index
-df_merged = aq_df.join(weather_df, how='inner')
-
-print("✅ Data merged successfully. Shape:", df_merged.shape)
-print("Merged data preview:\n", df_merged.head())
-
-# ===================================================================
-# 2. Prepare Data for GRU
-# ===================================================================
-print("\n🚀 Step 2: Preparing data for the GRU model...")
-
-# --- FIX: Handle non-numeric columns ---
-# First, let's identify any columns that are not numbers.
-object_cols = df_merged.select_dtypes(include=['object']).columns
-if len(object_cols) > 0:
-    print(f"Found non-numeric columns: {list(object_cols)}. Dropping them.")
-    df_merged = df_merged.drop(columns=object_cols)
-    # If you wanted to do one-hot encoding instead (the better fix), you would use:
-    # df_merged = pd.get_dummies(df_merged, columns=object_cols, drop_first=True)
-else:
-    print("No non-numeric columns found. Proceeding.")
+try:
+    # Load data
+    aq_df = pd.read_csv(AQ_DATA_FILE, parse_dates=True, index_col='datetime')
+    weather_df = pd.read_csv(WEATHER_DATA_FILE, parse_dates=True, index_col='DATE')
     
-# Select features (X) and target (y)
-features = df_merged.drop(columns=[TARGET_VARIABLE])
-target = df_merged[[TARGET_VARIABLE]]
+    # Merge on index
+    df_merged = aq_df.join(weather_df, how='inner')
+    print(" ✅  Data merged. Shape:", df_merged.shape)
 
-# Scale the data for better model performance
+except FileNotFoundError:
+    print(" ❌  Error: Files not found. Check your paths.")
+    exit()
+
+# ===================================================================
+# 2. Clean and Feature Selection (FIXING REDUNDANCY)
+# ===================================================================
+print("\n 🚀  Step 2: Selecting features and handling outliers...")
+
+# FIX 1: Explicitly select ONLY raw features. 
+# We DROP 'lag1', '7d_avg' etc. because GRU creates its own internal memory.
+# Feeding "lags of lags" creates noise.
+selected_columns = [
+    'pm25', 'pm10', 'no2', 'so2', 'co', 'o3',  # Pollutants
+    'temp', 'humidity', 'windspeed', 'precip'  # Weather
+]
+
+# Keep only existing columns from the list
+existing_cols = [c for c in selected_columns if c in df_merged.columns]
+df_model = df_merged[existing_cols].copy()
+
+# FIX 2: Handle Outliers (Clipping)
+# Extreme values (like CO > 6000) squash the MinMaxScaler, making normal variations invisible.
+print("    - Clipping outliers...")
+if 'pm25' in df_model.columns:
+    df_model['pm25'] = df_model['pm25'].clip(upper=600)  # Clip hazardous levels
+if 'pm10' in df_model.columns:
+    df_model['pm10'] = df_model['pm10'].clip(upper=900)
+if 'co' in df_model.columns:
+    df_model['co'] = df_model['co'].clip(upper=2000) # Clip extreme CO spikes
+
+# Handle missing values if any remain
+df_model = df_model.fillna(method='ffill').fillna(method='bfill')
+
+# ===================================================================
+# 3. Split and Scale (FIXING DATA LEAKAGE)
+# ===================================================================
+print("\n 🚀  Step 3: Splitting and Scaling (Correctly)...")
+
+# FIX 3: Split BEFORE Scaling
+# This prevents the model from "peeking" at the test set's min/max values.
+train_size = int(len(df_model) * 0.8)
+train_df = df_model.iloc[:train_size]
+test_df = df_model.iloc[train_size:]
+
+print(f"    - Training samples: {len(train_df)}")
+print(f"    - Testing samples: {len(test_df)}")
+
+# Define Scalers
 feature_scaler = MinMaxScaler()
 target_scaler = MinMaxScaler()
 
-X_scaled = feature_scaler.fit_transform(features)
-y_scaled = target_scaler.fit_transform(target)
+# Fit ONLY on Training Data
+print("    - Fitting scalers on training data...")
+X_train_scaled = feature_scaler.fit_transform(train_df)
+y_train_scaled = target_scaler.fit_transform(train_df[[TARGET_VARIABLE]])
 
-# --- Function to create sequences ---
-def create_sequences(X, y, time_steps=10):
-    """Creates sequences of data for time-series forecasting."""
-    X_seq, y_seq = [], []
+# Transform Test Data using the Training Scaler
+X_test_scaled = feature_scaler.transform(test_df)
+y_test_scaled = target_scaler.transform(test_df[[TARGET_VARIABLE]])
+
+# ===================================================================
+# 4. Create Sequences
+# ===================================================================
+def create_sequences(X, y, time_steps):
+    Xs, ys = [], []
     for i in range(len(X) - time_steps):
-        X_seq.append(X[i:(i + time_steps)])
-        y_seq.append(y[i + time_steps])
-    return np.array(X_seq), np.array(y_seq)
+        Xs.append(X[i:(i + time_steps)])
+        ys.append(y[i + time_steps])
+    return np.array(Xs), np.array(ys)
 
-# Create the sequences
-X_seq, y_seq = create_sequences(X_scaled, y_scaled, TIME_STEPS)
-print(f"✅ Data sequenced. X shape: {X_seq.shape}, y shape: {y_seq.shape}")
+X_train, y_train = create_sequences(X_train_scaled, y_train_scaled, TIME_STEPS)
+X_test, y_test = create_sequences(X_test_scaled, y_test_scaled, TIME_STEPS)
 
-# Split data into training and testing sets (80% train, 20% test)
-# For time-series, we don't shuffle the data to maintain chronological order
-X_train, X_test, y_train, y_test = train_test_split(X_seq, y_seq, test_size=0.2, shuffle=False)
-print(f"Data split into training and testing sets.")
-print(f"X_train shape: {X_train.shape}, X_test shape: {X_test.shape}")
+print(f" ✅  Sequences created. X_train shape: {X_train.shape}")
 
 # ===================================================================
-# 3. Build the GRU Model
+# 5. Build GRU Model
 # ===================================================================
-print("\n🚀 Step 3: Building the GRU model...")
+print("\n 🚀  Step 5: Building GRU Model...")
 
-# Get the input shape for the model
-input_shape = (X_train.shape[1], X_train.shape[2]) # (TIME_STEPS, num_features)
-
-# Define the model architecture using Keras Functional API
+input_shape = (X_train.shape[1], X_train.shape[2]) # (TIME_STEPS, features)
 input_layer = Input(shape=input_shape)
-# A GRU layer with 128 units. You can experiment with this number.
-gru_layer = GRU(128, activation='relu')(input_layer)
-# Output layer with a single neuron for our single target value
-output_layer = Dense(1, activation='linear')(gru_layer)
+
+# IMPROVEMENT: Added Dropout to prevent overfitting
+x = GRU(128, return_sequences=False, activation='relu')(input_layer)
+x = Dropout(0.2)(x) 
+output_layer = Dense(1)(x)
 
 model = Model(inputs=input_layer, outputs=output_layer)
-
-# Compile the model
-model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error', metrics=['mae'])
+model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
 model.summary()
 
 # ===================================================================
-# 4. Train the Model
+# 6. Train
 # ===================================================================
-print("\n🚀 Step 4: Training the GRU model...")
-
 history = model.fit(
-    X_train,
-    y_train,
+    X_train, y_train,
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
-    validation_split=0.1, # Use 10% of training data for validation
+    validation_split=0.1,
     verbose=1
 )
 
-print("✅ Model training complete.")
-
 # ===================================================================
-# 5. Evaluate the Model
+# 7. Evaluate
 # ===================================================================
-print("\n🚀 Step 5: Evaluating the model performance...")
+print("\n 🚀  Step 7: Evaluating...")
 
-# Make predictions on the test set
+# Predict
 y_pred_scaled = model.predict(X_test)
 
-# **IMPORTANT**: Inverse transform the predictions and actual values
+# Inverse Transform
 y_pred = target_scaler.inverse_transform(y_pred_scaled)
-y_test_actual = target_scaler.inverse_transform(y_test)
+y_actual = target_scaler.inverse_transform(y_test)
 
-# --- Here is the calculation ---
-mse = mean_squared_error(y_test_actual, y_pred) # Mean Squared Error
-rmse = np.sqrt(mse)                             # Root Mean Squared Error
-mae = mean_absolute_error(y_test_actual, y_pred) # Mean Absolute Error
-r2 = r2_score(y_test_actual, y_pred)
+# Calculate Metrics
+mse = np.mean((y_actual - y_pred)**2)
+rmse = np.sqrt(mse)
+mae = np.mean(np.abs(y_actual - y_pred))
 
-print("\n--- Model Evaluation Metrics ---")
-print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
-print(f"Mean Absolute Error (MAE): {mae:.2f}")
-print(f"R-squared (R²): {r2:.2f}")
-print("---------------------------------")
+print("\n==================================")
+print(f" RESULTS FOR {TARGET_VARIABLE}")
+print("==================================")
+print(f" RMSE: {rmse:.2f}")
+print(f" MAE:  {mae:.2f}")
+print("==================================")
 
-# ===================================================================
-# 6. Visualize the Results
-# ===================================================================
-# ADD THIS IMPORT AT THE TOP OF YOUR SCRIPT
-import os 
-# If you've already imported it, you don't need to do it again.
-# An alternative that works on all operating systems is: import webbrowser
-# ===================================================================
-
-print("\n🚀 Step 6: Visualizing the results...")
-
-# ... (The first part of Step 6 remains the same) ...
-#
-# (Keep your existing plt.figure, plt.plot, plt.title, etc. code here)
+# Plot
 plt.figure(figsize=(15, 6))
-plt.plot(y_test_actual, label='Actual PM2.5', color='blue')
-plt.plot(y_pred, label='Predicted PM2.5', color='red', linestyle='--')
-plt.title('GRU Model: Actual vs. Predicted PM2.5')
-plt.xlabel('Time')
-plt.ylabel('PM2.5 Concentration')
+plt.plot(y_actual, label='Actual', color='blue', alpha=0.6)
+plt.plot(y_pred, label='Predicted (GRU)', color='red', linestyle='--')
+plt.title(f'Corrected GRU Model: {TARGET_VARIABLE} Prediction')
 plt.legend()
-plt.grid(True)
-#
-# ... (End of the plotting code) ...
-
-# Save the plot to a file
-output_filename = "gru_prediction_plot.png"
-plt.savefig(output_filename)
-print(f"✅ Plot saved as '{output_filename}'")
-
-# Automatically open the saved image file
-try:
-    os.startfile(output_filename) # For Windows
-    # For macOS, use: os.system(f"open {output_filename}")
-    # For Linux, use: os.system(f"xdg-open {output_filename}")
-    # Or use the cross-platform version: webbrowser.open(output_filename)
-except AttributeError:
-    print("\nCould not automatically open the file. Please open it manually.")
-
-print("✅ All steps complete!")
+plt.savefig("gru_corrected_results.png")
+print(" ✅  Plot saved as 'gru_corrected_results.png'")
+plt.show()

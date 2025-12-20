@@ -6,79 +6,48 @@ import numpy as np
 # ===================================================================
 # Configuration
 # ===================================================================
-# Define constants for easier modification
+OUTPUT_FILE = "delhi_aq_cleaned_raw.csv" # Renamed to indicate it's RAW data
 POLLUTANTS = ["pm25", "pm10", "no2", "so2", "co", "o3"]
-LAG_DAYS = 7
-ROLLING_WINDOW = 7
-OUTPUT_FILE = "delhi_aq_featured_daily.csv"
 
 # ===================================================================
-# 1. Load and Clean Data
+# 1. Load Data
 # ===================================================================
-print("🚀 Starting data preparation...")
-
-# Download the dataset from Kaggle and get the path to its folder
+print(" 🚀  Starting data preparation...")
 path = kagglehub.dataset_download("deepaksirohiwal/delhi-air-quality")
 csv_file = os.path.join(path, "delhi_aqi.csv")
-print(f"Dataset downloaded to: {path}")
 
-# Read the CSV file
 df = pd.read_csv(csv_file)
-
-# Convert 'date' to datetime and set it as the index
 df['datetime'] = pd.to_datetime(df['date'])
 df = df.set_index('datetime').drop(columns=['date'])
 
-# Rename columns to a standard format for consistency
+# Rename columns
 rename_dict = {"pm2_5": "pm25"}
 df = df.rename(columns=rename_dict)
 
-# Select only the pollutant columns we need
-# The 'inplace=True' argument ensures we keep only columns that exist in the dataframe
+# Select columns
 df = df[df.columns.intersection(POLLUTANTS)]
 
-# Fill any missing values using the last known value (forward fill)
-df.fillna(method="ffill", inplace=True)
-
-print("✅ Data loading and cleaning complete.")
-print("Initial data shape:", df.shape)
-print("Preview of cleaned data:\n", df.head())
-
+# ===================================================================
+# 2. Outlier Removal (NEW & CRITICAL)
+# ===================================================================
+# We clip extreme values to preventing them from ruining the scaler later.
+print(" ✂️   Clipping extreme outliers...")
+if 'pm25' in df.columns: df['pm25'] = df['pm25'].clip(upper=600)
+if 'pm10' in df.columns: df['pm10'] = df['pm10'].clip(upper=900)
+if 'co' in df.columns:   df['co'] = df['co'].clip(upper=5000) 
+if 'so2' in df.columns:  df['so2'] = df['so2'].clip(upper=200)
+if 'no2' in df.columns:  df['no2'] = df['no2'].clip(upper=300)
 
 # ===================================================================
-# 2. Resample and Engineer Features
+# 3. Resample and Save
 # ===================================================================
-print("\n🚀 Starting feature engineering...")
-
-# Resample the hourly data to daily averages
+# Resample to daily averages
 daily_df = df.resample("D").mean()
 
-# Interpolate to fill any gaps that might have been created during resampling
-daily_df = daily_df.interpolate(method='linear')
+# Fill missing values
+daily_df = daily_df.interpolate(method='linear').fillna(method='bfill')
 
-# --- Efficient Feature Creation Loop ---
-for pollutant in POLLUTANTS:
-    # Check if the pollutant column exists in our daily dataframe
-    if pollutant in daily_df.columns:
-        # Create lag features (values from previous days)
-        for lag in range(1, LAG_DAYS + 1):
-            daily_df[f"{pollutant}_lag{lag}"] = daily_df[pollutant].shift(lag)
-
-        # Create rolling window features (average and std dev over a period)
-        rolling_stats = daily_df[pollutant].rolling(window=ROLLING_WINDOW)
-        daily_df[f"{pollutant}_{ROLLING_WINDOW}d_avg"] = rolling_stats.mean()
-        daily_df[f"{pollutant}_{ROLLING_WINDOW}d_std"] = rolling_stats.std()
-
-# Drop rows with NaN values, which are created by the lag/rolling features at the start of the dataset
-daily_df.dropna(inplace=True)
-
-print("✅ Feature engineering complete.")
-print("Final shape after adding features:", daily_df.shape)
-print("Preview of data with new features:\n", daily_df.head())
-
-
-# ===================================================================
-# 3. Save Final Dataset
-# ===================================================================
+# Save the CLEAN RAW data (No Scaling, No Lags)
 daily_df.to_csv(OUTPUT_FILE)
-print(f"\n✅ Successfully saved the final dataset as '{OUTPUT_FILE}'")
+print(f" ✅  Successfully saved cleaned raw data to '{OUTPUT_FILE}'")
+print(daily_df.head())
