@@ -31,35 +31,52 @@ wind_issues = df[df['wind_speed_10m'] > 100] if 'wind_speed_10m' in df.columns e
 print(f"4. Extreme Wind Events (>100km/h): {len(wind_issues)} hours")
 
 print("-" * 30)
-
 # VISUALIZATION
-fig, axes = plt.subplots(3, 1, figsize=(15, 12))
 
+# ---------------------------------------------------------
 # Plot 1: Temperature Seasonality (The "Wave")
-df['Temperature'].plot(ax=axes[0], color='#d62728', title='1. Temperature Check: Do you see yearly Summer/Winter waves?')
-axes[0].set_ylabel('Temp (°C)')
+# ---------------------------------------------------------
+plt.figure(figsize=(15, 4))
+df['Temperature'].plot(color='#d62728', title='1. Temperature Check: Do you see yearly Summer/Winter waves?')
+plt.ylabel('Temp (°C)')
+plt.tight_layout()
+plt.show()  # This will display the first plot
 
+# ---------------------------------------------------------
 # Plot 2: Monsoon Check (Rain & Humidity)
-# We plot Humidity in Blue and Rain as bars in Green
-ax2 = axes[1]
-df['Humidity'].rolling(24).mean().plot(ax=ax2, color='blue', alpha=0.6, label='Humidity (24h Avg)')
-ax2_twin = ax2.twinx()
-df['Rain'].resample('W').sum().plot(kind='area', ax=ax2_twin, color='green', alpha=0.3, label='Weekly Rain')
-ax2.set_title('2. Monsoon Check: Does Humidity/Rain spike every July-Sept?')
-ax2.legend(loc='upper left')
-ax2_twin.set_ylabel('Rain (mm)')
+# ---------------------------------------------------------
+# We use subplots here just to get the 'ax1' object for the twin axes
+fig, ax1 = plt.subplots(figsize=(15, 4))
 
-# Plot 3: Wind Vectors (The "Blob")
-# If Wind_X and Wind_Y are correct, a scatter plot should look like a circular "blob" or "star"
-# If it looks like a straight line or a box, something is wrong.
-axes[2].scatter(df['Wind_X'], df['Wind_Y'], alpha=0.1, s=1, color='purple')
-axes[2].set_title('3. Wind Vector Integrity: Should look like a circular blob (not a line!)')
-axes[2].set_xlabel('Wind X (East-West)')
-axes[2].set_ylabel('Wind Y (North-South)')
-axes[2].grid(True)
-# Draw crosshairs
-axes[2].axhline(0, color='black', lw=1)
-axes[2].axvline(0, color='black', lw=1)
+# Humidity on the primary y-axis
+df['Humidity'].rolling(24).mean().plot(ax=ax1, color='blue', alpha=0.6, label='Humidity (24h Avg)')
+ax1.set_ylabel('Humidity (%)')
+ax1.set_title('2. Monsoon Check: Does Humidity/Rain spike every July-Sept?')
+ax1.legend(loc='upper left')
+
+# Rain on the secondary y-axis
+ax2 = ax1.twinx()
+df['Rain'].resample('W').sum().plot(kind='area', ax=ax2, color='green', alpha=0.3, label='Weekly Rain')
+ax2.set_ylabel('Rain (mm)')
+ax2.legend(loc='upper right')
 
 plt.tight_layout()
-plt.show()
+plt.show()  # This will display the second plot
+
+# ---------------------------------------------------------
+# Plot 3: Wind Vectors (The "Blob")
+# ---------------------------------------------------------
+# A square figure (8x8) is best here so the circular wind blob isn't stretched into an oval
+plt.figure(figsize=(8, 8))
+plt.scatter(df['Wind_X'], df['Wind_Y'], alpha=0.1, s=1, color='purple')
+plt.title('3. Wind Vector Integrity: Should look like a circular blob')
+plt.xlabel('Wind X (East-West)')
+plt.ylabel('Wind Y (North-South)')
+plt.grid(True)
+
+# Draw crosshairs
+plt.axhline(0, color='black', lw=1)
+plt.axvline(0, color='black', lw=1)
+
+plt.tight_layout()
+plt.show()  # This will display the third plot

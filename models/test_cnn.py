@@ -4,88 +4,140 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, Dense, Dropout, Conv1D, MaxPooling1D, Flatten
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import math
 
 # ==============================================================================
-# 1. SETUP
+# 1. CONFIGURATION & 2. LOAD DATA
 # ==============================================================================
 FILE_NAME = 'Final_Model_Data.csv'
-TIME_STEPS = 24  # CNN needs a window to see patterns
+TEST_SPLIT = 0.2 
 
-# ==============================================================================
-# 2. DATA PREP (Same as before)
-# ==============================================================================
+print("⏳ Loading Final Dataset for CNN...")
 df = pd.read_csv(FILE_NAME, index_col=0, parse_dates=True)
+
 feature_cols = [c for c in df.columns if c != 'pm25']
 target_col = 'pm25'
+
 X = df[feature_cols].values
 y = df[target_col].values.reshape(-1, 1)
 
-split_idx = int(len(df) * 0.8)
+# ==============================================================================
+# 3. SPLIT & 4. NORMALIZATION
+# ==============================================================================
+split_idx = int(len(df) * (1 - TEST_SPLIT))
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
+
 scaler_X = MinMaxScaler()
 scaler_y = MinMaxScaler()
 
-X_train_raw = scaler_X.fit_transform(X[:split_idx])
-y_train_raw = scaler_y.fit_transform(y[:split_idx])
-X_test_raw = scaler_X.transform(X[split_idx:])
-y_test_raw = scaler_y.transform(y[split_idx:])
-
-def create_sequences(X_data, y_data, time_steps):
-    Xs, ys = [], []
-    for i in range(len(X_data) - time_steps):
-        Xs.append(X_data[i:(i + time_steps)])
-        ys.append(y_data[i + time_steps])
-    return np.array(Xs), np.array(ys)
-
-X_train, y_train = create_sequences(X_train_raw, y_train_raw, TIME_STEPS)
-X_test, y_test = create_sequences(X_test_raw, y_test_raw, TIME_STEPS)
+X_train_scaled = scaler_X.fit_transform(X_train)
+y_train_scaled = scaler_y.fit_transform(y_train)
+X_test_scaled = scaler_X.transform(X_test)
+y_test_scaled = scaler_y.transform(y_test)
 
 # ==============================================================================
-# 3. BUILD STANDARD CNN
+# 5. RESHAPE FOR CNN (1D)
 # ==============================================================================
-print("🧠 Building Standard CNN...")
+# CNN 1D expects: (Samples, TimeSteps, Features)
+# Since we are using a "Point-in-Time" prediction, TimeSteps = 1
+X_train_reshaped = X_train_scaled.reshape((X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
+X_test_reshaped = X_test_scaled.reshape((X_test_scaled.shape[0], 1, X_test_scaled.shape[1]))
+
+# ==============================================================================
+# 6. BUILD MODEL (CNN VERSION)
+# ==============================================================================
+print("🧠 Building 1D CNN Neural Network...")
 model = Sequential()
 
-model.add(Input(shape=(TIME_STEPS, X_train.shape[2])))
+# CNN Layer 1: Filters look for patterns across features
+model.add(Input(shape=(1, X_train.shape[1])))
+model.add(Conv1D(filters=64, kernel_size=1, activation='relu')) 
+model.add(Dropout(0.2))
 
-# Layer 1: Conv1D (Scans the 24-hour window)
-model.add(Conv1D(filters=64, kernel_size=3, activation='relu'))
-model.add(MaxPooling1D(pool_size=2)) # Shrinks data, keeps strongest features
+# CNN Layer 2
+model.add(Conv1D(filters=32, kernel_size=1, activation='relu'))
+model.add(Dropout(0.2))
 
-# Layer 2: Conv1D (Finds higher-level patterns)
-model.add(Conv1D(filters=32, kernel_size=3, activation='relu'))
-# No pooling here to keep some detail
-
-# Flatten: Convert 3D maps to 2D for the dense layer
+# Flattening the 3D output to 2D for the Dense layers
 model.add(Flatten())
 
-model.add(Dense(64, activation='relu'))
-model.add(Dropout(0.2))
-model.add(Dense(1))
+# Fully Connected Layers
+model.add(Dense(50, activation='relu'))
+model.add(Dense(1)) # Output Layer
 
 model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
 model.summary()
 
 # ==============================================================================
-# 4. TRAIN & EVALUATE
+# 7. TRAIN
 # ==============================================================================
-model.fit(X_train, y_train, epochs=30, batch_size=32, verbose=1, validation_data=(X_test, y_test))
+print("🚀 Training CNN Started...")
+history = model.fit(
+    X_train_reshaped, y_train_scaled,
+    epochs=50,
+    batch_size=32,
+    validation_data=(X_test_reshaped, y_test_scaled),
+    verbose=1
+)
 
-print("\n📊 Calculating Standard CNN Metrics...")
-test_predictions = model.predict(X_test)
-y_test_inv = scaler_y.inverse_transform(y_test)
-pred_inv = scaler_y.inverse_transform(test_predictions)
+# ==============================================================================
+# 8. PREDICT & VISUALIZE (Simplified for brevity)
+# ==============================================================================
+print("🔮 Forecasting with CNN...")
+predictions_scaled = model.predict(X_test_reshaped)
+predictions_actual = scaler_y.inverse_transform(predictions_scaled)
+y_test_actual = scaler_y.inverse_transform(y_test_scaled)
 
-rmse = math.sqrt(mean_squared_error(y_test_inv, pred_inv))
-mae = mean_absolute_error(y_test_inv, pred_inv)
-r2 = r2_score(y_test_inv, pred_inv)
+plt.figure(figsize=(15, 6))
+plt.plot(y_test_actual[:500], label='Actual PM2.5', color='blue', alpha=0.6)
+plt.plot(predictions_actual[:500], label='CNN Prediction', color='red', linestyle='--')
+plt.title('Final CNN Model: Actual vs Predicted')
+plt.legend()
+plt.show()
+# ... (Previous code for data loading and model training remains the same)
 
-print("-" * 40)
-print(f"STANDARD CNN RESULTS:")
-print(f"RMSE: {rmse:.2f}")
-print(f"MAE:  {mae:.2f}")
-print(f"R²:   {r2:.4f}")
-print("-" * 40)
+# ==============================================================================
+# 9. CALCULATE METRICS (TRAINING SET)
+# ==============================================================================
+print("📊 Calculating CNN Training Metrics...")
+
+train_predict_scaled = model.predict(X_train_reshaped)
+y_train_actual = scaler_y.inverse_transform(y_train_scaled)
+train_predict_actual = scaler_y.inverse_transform(train_predict_scaled)
+
+mse_train = mean_squared_error(y_train_actual, train_predict_actual)
+rmse_train = math.sqrt(mse_train)
+mae_train = mean_absolute_error(y_train_actual, train_predict_actual) # <--- Added MAE
+r2_train = r2_score(y_train_actual, train_predict_actual)
+
+# ==============================================================================
+# 10. CALCULATE & COMPARE TEST METRICS
+# ==============================================================================
+print("\n📊 Calculating CNN TEST Metrics...")
+
+test_predictions_scaled = model.predict(X_test_reshaped)
+y_test_actual = scaler_y.inverse_transform(y_test_scaled)
+test_predictions_actual = scaler_y.inverse_transform(test_predictions_scaled)
+
+mse_test = mean_squared_error(y_test_actual, test_predictions_actual)
+rmse_test = math.sqrt(mse_test)
+mae_test = mean_absolute_error(y_test_actual, test_predictions_actual) # <--- Added MAE
+r2_test = r2_score(y_test_actual, test_predictions_actual)
+
+print("-" * 60)
+print(f"{'METRIC':<10} | {'TRAIN':<18} | {'TEST':<18}")
+print("-" * 60)
+print(f"{'RMSE':<10} | {rmse_train:<18.2f} | {rmse_test:<18.2f}")
+print(f"{'MAE':<10} | {mae_train:<18.2f} | {mae_test:<18.2f}") # <--- Displayed MAE
+print(f"{'R²':<10} | {r2_train:<18.4f} | {r2_test:<18.4f}")
+print("-" * 60)
+
+# ==============================================================================
+# 11. SAVE
+# ==============================================================================
+model.save('best_cnn_model.keras')
+print("✅ CNN Model and Scalers saved.")
